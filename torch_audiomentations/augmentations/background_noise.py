@@ -1,6 +1,7 @@
 import random
 from pathlib import Path
 from typing import Union, List, Optional
+import math
 
 import torch
 from torch import Tensor
@@ -32,6 +33,9 @@ class AddBackgroundNoise(BaseWaveformTransform):
         background_paths: Union[List[Path], List[str], Path, str],
         min_snr_in_db: float = 3.0,
         max_snr_in_db: float = 30.0,
+        min_len_ratio: float = 0.1,
+        max_len_ratio: float = 0.5,
+        repeat_same: bool = False,
         mode: str = "per_example",
         p: float = 0.5,
         p_mode: str = None,
@@ -74,37 +78,71 @@ class AddBackgroundNoise(BaseWaveformTransform):
         if self.min_snr_in_db > self.max_snr_in_db:
             raise ValueError("min_snr_in_db must not be greater than max_snr_in_db")
 
+        self.min_len_ratio = min_len_ratio
+        self.max_len_ratio = max_len_ratio
+        if self.min_len_ratio > self.max_len_ratio and self.min_len_ratio < 1.0:
+            raise ValueError("min_len_ratio must not be greater than max_len_ratio")
+
+        self.repeat_same = repeat_same
+
     def random_background(self, audio: Audio, target_num_samples: int) -> torch.Tensor:
         pieces = []
 
         # TODO: support repeat short samples instead of concatenating from different files
 
-        missing_num_samples = target_num_samples
-        while missing_num_samples > 0:
+        if not self.repeat_same:
+            missing_num_samples = target_num_samples
+            while missing_num_samples > 0:
+                background_path = random.choice(self.background_paths)
+                background_num_samples = audio.get_num_samples(background_path)
+
+                if background_num_samples > missing_num_samples:
+                    sample_offset = random.randint(
+                        0, background_num_samples - missing_num_samples
+                    )
+                    num_samples = missing_num_samples
+                    background_samples = audio(
+                        background_path,
+                        sample_offset=sample_offset,
+                        num_samples=num_samples,
+                    )
+                    missing_num_samples = 0
+                else:
+                    background_samples = audio(background_path)
+                    missing_num_samples -= background_num_samples
+
+                pieces.append(background_samples)
+            # the inner call to rms_normalize ensures concatenated pieces share the same RMS (1)
+            # the outer call to rms_normalize ensures that the resulting background has an RMS of 1
+            # (this simplifies "apply_transform" logic)
+            return audio.rms_normalize(
+                torch.cat([audio.rms_normalize(piece) for piece in pieces], dim=1)
+            )
+        else:
             background_path = random.choice(self.background_paths)
             background_num_samples = audio.get_num_samples(background_path)
-
-            if background_num_samples > missing_num_samples:
+            if background_num_samples > target_num_samples:
                 sample_offset = random.randint(
-                    0, background_num_samples - missing_num_samples
+                    0, background_num_samples - target_num_samples
                 )
-                num_samples = missing_num_samples
                 background_samples = audio(
-                    background_path, sample_offset=sample_offset, num_samples=num_samples
+                    background_path,
+                    sample_offset=sample_offset,
+                    num_samples=target_num_samples,
                 )
-                missing_num_samples = 0
             else:
                 background_samples = audio(background_path)
-                missing_num_samples -= background_num_samples
+                n_repeat = math.ceil(target_num_samples / background_num_samples)
+                background_samples = background_samples.repeat(1, n_repeat)
+                if background_samples.shape[1] > target_num_samples:
+                    sample_offset = random.randint(
+                        0, background_samples.shape[1] - target_num_samples
+                    )
+                    background_samples = background_samples[
+                        :, sample_offset : sample_offset + target_num_samples
+                    ]
 
-            pieces.append(background_samples)
-
-        # the inner call to rms_normalize ensures concatenated pieces share the same RMS (1)
-        # the outer call to rms_normalize ensures that the resulting background has an RMS of 1
-        # (this simplifies "apply_transform" logic)
-        return audio.rms_normalize(
-            torch.cat([audio.rms_normalize(piece) for piece in pieces], dim=1)
-        )
+            return audio.rms_normalize(background_samples)
 
     def randomize_parameters(
         self,
@@ -148,6 +186,14 @@ class AddBackgroundNoise(BaseWaveformTransform):
                 sample_shape=(batch_size,)
             )
 
+        # randomize noise segments
+        if self.min_len_ratio < 1.0:
+            self.transform_parameters["segment_len"] = torch.randint(
+                int(num_samples * self.min_len_ratio),
+                int(num_samples * self.max_len_ratio),
+                (batch_size,),
+            ).tolist()
+
     def apply_transform(
         self,
         samples: Tensor = None,
@@ -165,10 +211,21 @@ class AddBackgroundNoise(BaseWaveformTransform):
             10 ** (self.transform_parameters["snr_in_db"].unsqueeze(dim=-1) / 20)
         )
 
+        background_samples = background_rms.unsqueeze(-1) * background.view(
+            batch_size, 1, num_samples
+        ).expand(-1, num_channels, -1)
+
+        if self.min_len_ratio < 1.0:
+            mixed_samples = samples.clone()
+            for i, l in enumerate(self.transform_parameters["segment_len"]):
+                s1 = torch.randint(0, samples.shape[2] - l, (1,))
+                s2 = torch.randint(0, samples.shape[2] - l, (1,))
+                mixed_samples[i, :, s1 : s1 + l] += background_samples[i, :, s2 : s2 + l]
+        else:
+            mixed_samples = samples + background_samples
+
         return ObjectDict(
-            samples=samples
-            + background_rms.unsqueeze(-1)
-            * background.view(batch_size, 1, num_samples).expand(-1, num_channels, -1),
+            samples=mixed_samples,
             sample_rate=sample_rate,
             targets=targets,
             target_rate=target_rate,

@@ -33,6 +33,8 @@ class Mix(BaseWaveformTransform):
         self,
         min_snr_in_db: float = 0.0,
         max_snr_in_db: float = 5.0,
+        min_len_ratio: float = 0.1,
+        max_len_ratio: float = 0.5,
         mix_target: str = "union",
         mode: str = "per_example",
         p: float = 0.5,
@@ -53,6 +55,11 @@ class Mix(BaseWaveformTransform):
         self.max_snr_in_db = max_snr_in_db
         if self.min_snr_in_db > self.max_snr_in_db:
             raise ValueError("min_snr_in_db must not be greater than max_snr_in_db")
+
+        self.min_len_ratio = min_len_ratio
+        self.max_len_ratio = max_len_ratio
+        if self.min_len_ratio > self.max_len_ratio and self.min_len_ratio < 1.0:
+            raise ValueError("min_len_ratio must not be greater than max_len_ratio")
 
         self.mix_target = mix_target
         if mix_target == "original":
@@ -102,6 +109,14 @@ class Mix(BaseWaveformTransform):
             device=samples.device,
         )
 
+        # randomize noise segments
+        if self.min_len_ratio < 1.0:
+            self.transform_parameters["segment_len"] = torch.randint(
+                int(num_samples * self.min_len_ratio),
+                int(num_samples * self.max_len_ratio),
+                (batch_size,),
+            ).tolist()
+
     def apply_transform(
         self,
         samples: Tensor = None,
@@ -115,8 +130,16 @@ class Mix(BaseWaveformTransform):
 
         background_samples = Audio.rms_normalize(samples[idx])
         background_rms = calculate_rms(samples) / (10 ** (snr.unsqueeze(dim=-1) / 20))
+        background_samples = background_rms.unsqueeze(-1) * background_samples
 
-        mixed_samples = samples + background_rms.unsqueeze(-1) * background_samples
+        if self.min_len_ratio < 1.0:
+            mixed_samples = samples.clone()
+            for i, l in enumerate(self.transform_parameters["segment_len"]):
+                s1 = torch.randint(0, samples.shape[2] - l, (1,))
+                s2 = torch.randint(0, samples.shape[2] - l, (1,))
+                mixed_samples[i, :, s1 : s1 + l] += background_samples[i, :, s2 : s2 + l]
+        else:
+            mixed_samples = samples + background_samples
 
         if targets is None:
             mixed_targets = None
